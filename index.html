@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Zanskar Feed – Blog/News/Press Filters</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --ink:#333; --muted:#777; --pill:#404040; --pillActive:#808080; --card:#fff; --line:#eee; }
+    body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+           margin:2rem; color:var(--ink); background:#fff; }
+    .filters { display:flex; flex-wrap:wrap; gap:.5rem; margin-bottom:1.25rem; }
+    .filters button { padding:.5rem .85rem; border:none; border-radius:999px; background:var(--pill); color:#fff; cursor:pointer; font-size:.95rem; }
+    .filters button.active { background:var(--pillActive); }
+    #feed { display:grid; gap:2rem; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); }
+    .post { background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden;
+            box-shadow:0 2px 6px rgba(0,0,0,.05); transition:box-shadow .2s ease; }
+    .post:hover { box-shadow:0 4px 12px rgba(0,0,0,.1); }
+    .post img { width:100%; height:180px; object-fit:cover; display:block; }
+    .noimg { height:180px; background:#f3f3f3; color:#9a9a9a; display:flex; align-items:center; justify-content:center; font-size:.9rem; }
+    .post-content { padding:1rem; }
+    .post-title { font-weight:700; font-size:1rem; margin:0 0 .5rem; }
+    .post-title a { color:var(--ink); text-decoration:none; }
+    .post-title a:hover { text-decoration:underline; }
+    .post-date { font-size:.85rem; color:var(--muted); }
+    .status { grid-column:1/-1; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="filters">
+    <button data-filter="__all__" class="active">All</button>
+    <button data-filter="blog">Blog</button>
+    <button data-filter="news">News</button>
+    <button data-filter="press">Press</button>
+  </div>
+
+  <div id="feed">Loading posts...</div>
+
+  <script>
+    // ===== CONFIG =====
+    const PUB = "https://zanskargeothermal.substack.com";
+
+    // Auto-refresh cadence for rss2json cache (minutes).
+    // You can bump to 10 if you want even less load / fewer rate-limit blips.
+    const BUCKET_MINUTES = 5;
+    const TS_BUCKET = Math.floor(Date.now() / (BUCKET_MINUTES * 60 * 1000));
+
+    // Aliases so “Blogs” or “Media Coverage” still match.
+    const TAG_ALIASES = {
+      blog:  ["blog", "blogs"],
+      news:  ["news"],
+      press: ["press", "press-release", "press-releases", "media", "media-coverage", "media coverage"]
+    };
+
+    // Optional manual image overrides (exact post title -> image URL)
+    const imageMap = {
+      // "Exact Post Title": "https://your-cdn.com/image.jpg",
+    };
+
+    // ===== UTIL =====
+    const norm = s => (s || "").trim().toLowerCase();
+    const slugify = s => norm(s).replace(/[\s_]+/g, "-");
+
+    // ===== FEED URL HELPERS =====
+    function tagFeedUrlsFor(slug) {
+      return [
+        `${PUB}/feed?tag=${encodeURIComponent(slug)}`,
+        `${PUB}/feed/tag/${encodeURIComponent(slug)}`,
+        `${PUB}/t/${encodeURIComponent(slug)}?format=rss`,
+      ];
+    }
+    function allTagFeedUrlsForAliases(aliases) {
+      return aliases.flatMap(tagFeedUrlsFor);
+    }
+    function baseFeedUrls() { return [ `${PUB}/feed` ]; }
+
+    function rss2jsonUrl(rssUrl) {
+      const bust = rssUrl.includes("?") ? `${rssUrl}&ts=${TS_BUCKET}` : `${rssUrl}?ts=${TS_BUCKET}`;
+      return "https://api.rss2json.com/v1/api.json?rss_url=" + encodeURIComponent(bust);
+    }
+
+    // ===== IMAGE RESOLVER =====
+    function firstImgFromHtml(html) {
+      try {
+        if (!html) return "";
+        const tmp = document.createElement("div");
+        tmp.innerHTML = html;
+        const img = tmp.querySelector("img");
+        return img?.src || "";
+      } catch { return ""; }
+    }
+    function getImageUrl(item, title) {
+      if (item.thumbnail) return item.thumbnail;
+      if (item.enclosure) {
+        const e = item.enclosure;
+        if (e.link) return e.link;
+        if (e.url)  return e.url;
+      }
+      if (Array.isArray(item.enclosures) && item.enclosures.length) {
+        const e0 = item.enclosures[0];
+        if (e0?.link) return e0.link;
+        if (e0?.url)  return e0.url;
+      }
+      let url = firstImgFromHtml(item.description);
+      if (!url && item.content) url = firstImgFromHtml(item.content);
+      if (!url && item.content_encoded) url = firstImgFromHtml(item.content_encoded);
+      if (!url && imageMap[title]) return imageMap[title];
+      return url || "";
+    }
+
+    // ===== TAG DETECTION (fallback path) =====
+    function inferFromTitlePrefix(title) {
+      const m = (title || "").match(/^(blog|news|press)\s*:/i);
+      return m ? m[1].toLowerCase() : "";
+    }
+    function extractTagSlugsFromHtml(html) {
+      const out = [];
+      try {
+        if (!html) return out;
+        const tmp = document.createElement("div");
+        tmp.innerHTML = html;
+        const anchors = tmp.querySelectorAll('a[href*="/t/"], a[rel="tag"], a[href*="/tag/"], a[href*="/tags/"]');
+        anchors.forEach(a => {
+          const href = a.getAttribute("href") || "";
+          const m = href.match(/\/t\/([^\/?#]+)/i) || href.match(/\/tags?\/([^\/?#]+)/i);
+          if (m && m[1]) out.push(m[1].toLowerCase());
+        });
+      } catch {}
+      return Array.from(new Set(out));
+    }
+    function itemMatchesAnyAlias(item, aliases) {
+      const aliasSet = new Set(aliases.map(a => slugify(a)));
+      // categories array from rss2json or our XML parse
+      if (Array.isArray(item.categories)) {
+        for (const c of item.categories) if (aliasSet.has(slugify(c))) return true;
+      }
+      // HTML tag links
+      const slugs = new Set([
+        ...extractTagSlugsFromHtml(item.description),
+        ...extractTagSlugsFromHtml(item.content),
+        ...extractTagSlugsFromHtml(item.content_encoded)
+      ].map(slugify));
+      for (const a of aliasSet) if (slugs.has(a)) return true;
+      // Title prefix fallback
+      const pref = inferFromTitlePrefix(item.title);
+      if (pref && aliasSet.has(slugify(pref))) return true;
+      return false;
+    }
+
+    // ===== FETCH with FALLBACK =====
+    // 1) Try rss2json; 2) If it fails/empty, fetch raw RSS via AllOrigins and parse.
+    async function fetchOneRss(rss) {
+      // rss2json attempt
+      try {
+        const url = rss2jsonUrl(rss);
+        const res = await fetch(url);
+        const data = await res.json();
+        if (data?.status === "ok" && Array.isArray(data.items) && data.items.length) {
+          return { status: "ok", items: data.items };
+        }
+      } catch (_) { /* fall through */ }
+
+      // Fallback: raw XML via permissive proxy + DOMParser
+      try {
+        const proxied = "https://api.allorigins.win/raw?url=" + encodeURIComponent(rss);
+        const xmlText = await fetch(proxied, { cache: "no-store" }).then(r => r.text());
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(xmlText, "application/xml");
+
+        const nodes = Array.from(doc.querySelectorAll("item"));
+        const items = nodes.map(n => {
+          const get = sel => n.querySelector(sel)?.textContent || "";
+          const title = get("title");
+          const link = get("link");
+          const pubDate = get("pubDate") || get("published") || "";
+          const description = get("description") || "";
+          const contentEncoded = get("content\\:encoded") || "";
+
+          // thumbnail / media / enclosure
+          let thumbnail = "";
+          const mediaContent = n.querySelector("media\\:content, content");
+          if (mediaContent?.getAttribute("url")) thumbnail = mediaContent.getAttribute("url");
+          const enclosure = n.querySelector("enclosure");
+          if (!thumbnail && enclosure?.getAttribute("url")) thumbnail = enclosure.getAttribute("url");
+
+          // categories
+          const categories = Array.from(n.querySelectorAll("category")).map(c => c.textContent.trim());
+
+          return {
+            title, link, pubDate,
+            description,
+            content: "",                 // keep shape similar to rss2json
+            content_encoded: contentEncoded,
+            thumbnail,
+            categories
+          };
+        });
+
+        return { status: "ok", items };
+      } catch (e2) {
+        return { status: "error", items: [], message: String(e2) };
+      }
+    }
+
+    // Merge results from multiple candidate tag feeds
+    const cache = new Map(); // key -> items[]
+    async function fetchItemsFromCandidates(key, candidates) {
+      if (cache.has(key)) return cache.get(key);
+
+      let merged = [];
+      const seen = new Set();
+
+      for (const rss of candidates) {
+        try {
+          const data = await fetchOneRss(rss);
+          if (data.status === "ok" && Array.isArray(data.items) && data.items.length) {
+            for (const it of data.items) {
+              const k = it.link || it.guid || JSON.stringify(it);
+              if (!seen.has(k)) {
+                merged.push(it);
+                seen.add(k);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("Feed try failed:", rss, e);
+        }
+      }
+      cache.set(key, merged); // cache even if empty to avoid thrash
+      return merged;
+    }
+
+    // ===== RENDER =====
+    function renderItems(items) {
+      const feedEl = document.getElementById("feed");
+      feedEl.innerHTML = "";
+
+      if (!items.length) {
+        feedEl.innerHTML = `<div class="status">No posts found for this filter yet.</div>`;
+        return;
+      }
+
+      items.forEach(item => {
+        const title = item.title || "";
+        const link = item.link || "#";
+        const dateStr = item.pubDate
+          ? new Date(item.pubDate).toLocaleDateString(undefined, { year:"numeric", month:"short", day:"numeric" })
+          : "";
+
+        const imageURL = getImageUrl(item, title);
+
+        const card = document.createElement("div");
+        card.className = "post";
+        card.innerHTML = `
+          ${imageURL ? `<img src="${imageURL}" alt="">` : `<div class="noimg">No Image</div>`}
+          <div class="post-content">
+            <div class="post-title"><a href="${link}" target="_blank" rel="noopener noreferrer">${title}</a></div>
+            <div class="post-date">${dateStr}</div>
+          </div>
+        `;
+        feedEl.appendChild(card);
+      });
+    }
+
+    // Load a filter
+    async function loadFilter(filter) {
+      const feedEl = document.getElementById("feed");
+      feedEl.innerHTML = `<div class="status">Loading…</div>`;
+
+      if (filter === "__all__") {
+        const all = await fetchItemsFromCandidates("all", baseFeedUrls());
+        renderItems(all);
+        return;
+      }
+
+      // 1) Try server-side tag feeds for all aliases, merged
+      const aliases = TAG_ALIASES[filter] || [filter];
+      const tagKey = `tag:${aliases.join(",")}`;
+      const tagCandidates = allTagFeedUrlsForAliases(aliases);
+      let items = await fetchItemsFromCandidates(tagKey, tagCandidates);
+
+      if (items.length) {
+        renderItems(items);
+        return;
+      }
+
+      // 2) Fallback: pull All feed then filter locally by any alias
+      const all = await fetchItemsFromCandidates("all", baseFeedUrls());
+      const filtered = all.filter(it => itemMatchesAnyAlias(it, aliases));
+      renderItems(filtered);
+    }
+
+    // Wire up buttons
+    document.querySelectorAll(".filters button").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".filters button").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        loadFilter(btn.dataset.filter);
+      });
+    });
+
+    // Initial load
+    loadFilter("__all__");
+  </script>
+</body>
+</html>
